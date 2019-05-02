@@ -4,14 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Sirupsen/logrus"
 	sls "github.com/aliyun/aliyun-log-go-sdk"
-	"github.com/sirupsen/logrus"
 	"os"
 	"time"
 )
 
 const (
-	defaultBatchInterval = 10 * time.Second
+	defaultBatchInterval = 5 * time.Second
 	defaultBatchSize     = 1000
 	defaultMaxAttempts   = 10
 	defaultBufferSize    = 32768
@@ -55,20 +55,20 @@ type Config struct {
 }
 
 func (config *Config) setDefaults() {
-	if config.MaxAttempts <= 0 {
-		config.MaxAttempts = defaultMaxAttempts
-	}
 	if config.BatchSize <= 0 {
 		config.BatchSize = defaultBatchSize
-	}
-	if config.BufferSize <= 0 {
-		config.BufferSize = defaultBufferSize
 	}
 	if config.BatchInterval <= 0 {
 		config.BatchInterval = defaultBatchInterval
 	}
+	if config.BufferSize <= 0 {
+		config.BufferSize = defaultBufferSize
+	}
 	if len(config.Levels) == 0 {
 		config.Levels = defaultLevels
+	}
+	if config.MaxAttempts <= 0 {
+		config.MaxAttempts = defaultMaxAttempts
 	}
 }
 
@@ -79,6 +79,7 @@ type Hook struct {
 	entryCh chan *logrus.Entry
 	flushCh chan chan bool
 	sendCh  chan *sls.LogGroup
+	ticker  *time.Ticker
 }
 
 // NewHook create a new async Log Service hook.
@@ -114,6 +115,7 @@ func NewHook(config *Config) (*Hook, error) {
 		entryCh: make(chan *logrus.Entry, config.BufferSize),
 		flushCh: make(chan chan bool),
 		sendCh:  make(chan *sls.LogGroup),
+		ticker:  time.NewTicker(config.BatchInterval),
 	}
 	go hook.collectEntries()
 	go hook.emitEntries()
@@ -124,9 +126,6 @@ func (hook *Hook) collectEntries() {
 	entries := make([]*logrus.Entry, 0)
 	config := hook.config
 	batchSize := int(config.BatchSize)
-	batchInterval := config.BatchInterval
-	timer := time.NewTimer(batchInterval)
-	var timerCh <-chan time.Time
 
 	for {
 		select {
@@ -135,25 +134,17 @@ func (hook *Hook) collectEntries() {
 			if len(entries) >= batchSize {
 				hook.send(entries)
 				entries = make([]*logrus.Entry, 0)
-				timerCh = nil
-			} else if timerCh == nil && batchInterval > 0 {
-				timer.Reset(batchInterval)
-				timerCh = timer.C
 			}
-
-		case <-timerCh:
+		case <-hook.ticker.C:
 			if len(entries) > 0 {
 				hook.send(entries)
 				entries = make([]*logrus.Entry, 0)
 			}
-			timerCh = nil
-
 		case done := <-hook.flushCh:
 			if len(entries) > 0 {
 				hook.send(entries)
 				entries = make([]*logrus.Entry, 0)
 			}
-			timerCh = nil
 			done <- true
 		}
 	}
@@ -177,7 +168,7 @@ func (hook *Hook) send(entries []*logrus.Entry) {
 }
 
 func convertEntryToLog(entry *logrus.Entry) *sls.Log {
-	ts := uint32(entry.Time.Second())
+	ts := uint32(entry.Time.Unix())
 	log := &sls.Log{
 		Time: &ts,
 	}
