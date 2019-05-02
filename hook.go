@@ -10,11 +10,13 @@ import (
 	"time"
 )
 
-const defaultBufferTimeout = 10 * time.Second
-const defaultBatchSize = 1000
-const defaultMaxAttempts = 10
+const (
+	defaultBatchInterval = 10 * time.Second
+	defaultBatchSize     = 1000
+	defaultMaxAttempts   = 10
+	defaultBufferSize    = 32768
+)
 
-var bufferSize = 32768
 var defaultLevels = []logrus.Level{
 	logrus.PanicLevel,
 	logrus.FatalLevel,
@@ -45,23 +47,45 @@ type Config struct {
 	UserAgent       string
 	Source          string
 	Tags            map[string]string
+	Levels          []logrus.Level
+	BatchSize       uint32
+	BatchInterval   time.Duration
+	BufferSize      int
+	MaxAttempts     int
+}
+
+func (config *Config) setDefaults() {
+	if config.MaxAttempts <= 0 {
+		config.MaxAttempts = defaultMaxAttempts
+	}
+	if config.BatchSize <= 0 {
+		config.BatchSize = defaultBatchSize
+	}
+	if config.BufferSize <= 0 {
+		config.BufferSize = defaultBufferSize
+	}
+	if config.BatchInterval <= 0 {
+		config.BatchInterval = defaultBatchInterval
+	}
+	if len(config.Levels) == 0 {
+		config.Levels = defaultLevels
+	}
 }
 
 // Hook represents the asynchronous Logrus hook to Log Service.
 type Hook struct {
-	client       *sls.Client
-	config       *Config
-	bufferTimout time.Duration
-	batchSize    uint32
-	maxAttempts  int
-	levels       []logrus.Level
-	entryCh      chan *logrus.Entry
-	flushCh      chan chan bool
-	sendCh       chan *sls.LogGroup
+	client  *sls.Client
+	config  *Config
+	entryCh chan *logrus.Entry
+	flushCh chan chan bool
+	sendCh  chan *sls.LogGroup
 }
 
 // NewHook create a new async Log Service hook.
 func NewHook(config *Config) (*Hook, error) {
+	if config == nil {
+		return nil, errors.New("config is nil")
+	}
 	if config.Endpoint == "" {
 		return nil, errors.New("endpoint must be specified")
 	}
@@ -77,6 +101,7 @@ func NewHook(config *Config) (*Hook, error) {
 	if config.Logstore == "" {
 		return nil, errors.New("logstore must be specified")
 	}
+	config.setDefaults()
 	client := &sls.Client{
 		Endpoint:        config.Endpoint,
 		AccessKeyID:     config.AccessKeyId,
@@ -84,15 +109,11 @@ func NewHook(config *Config) (*Hook, error) {
 		UserAgent:       config.UserAgent,
 	}
 	hook := &Hook{
-		client:       client,
-		levels:       defaultLevels,
-		config:       config,
-		bufferTimout: defaultBufferTimeout,
-		batchSize:    defaultBatchSize,
-		maxAttempts:  defaultMaxAttempts,
-		entryCh:      make(chan *logrus.Entry, bufferSize),
-		flushCh:      make(chan chan bool),
-		sendCh:       make(chan *sls.LogGroup),
+		client:  client,
+		config:  config,
+		entryCh: make(chan *logrus.Entry, config.BufferSize),
+		flushCh: make(chan chan bool),
+		sendCh:  make(chan *sls.LogGroup),
 	}
 	go hook.collectEntries()
 	go hook.emitEntries()
@@ -101,9 +122,10 @@ func NewHook(config *Config) (*Hook, error) {
 
 func (hook *Hook) collectEntries() {
 	entries := make([]*logrus.Entry, 0)
-	batchSize := int(hook.batchSize)
-	bufferTimout := hook.bufferTimout
-	timer := time.NewTimer(bufferTimout)
+	config := hook.config
+	batchSize := int(config.BatchSize)
+	batchInterval := config.BatchInterval
+	timer := time.NewTimer(batchInterval)
 	var timerCh <-chan time.Time
 
 	for {
@@ -114,8 +136,8 @@ func (hook *Hook) collectEntries() {
 				hook.send(entries)
 				entries = make([]*logrus.Entry, 0)
 				timerCh = nil
-			} else if timerCh == nil && bufferTimout > 0 {
-				timer.Reset(bufferTimout)
+			} else if timerCh == nil && batchInterval > 0 {
+				timer.Reset(batchInterval)
 				timerCh = timer.C
 			}
 
@@ -190,7 +212,7 @@ func (hook *Hook) emitEntries() {
 		select {
 		case logGroup := <-hook.sendCh:
 			var err error
-			for i := 0; i < hook.maxAttempts; i++ {
+			for i := 0; i < config.MaxAttempts; i++ {
 				err = hook.client.PutLogs(config.Project, config.Logstore, logGroup)
 				if err == nil {
 					break
@@ -207,22 +229,7 @@ func (hook *Hook) emitEntries() {
 
 // Levels returns logging level to fire this hook.
 func (hook *Hook) Levels() []logrus.Level {
-	return hook.levels
-}
-
-// SetLevels sets logging level to fire this hook.
-func (hook *Hook) SetLevels(levels []logrus.Level) {
-	hook.levels = levels
-}
-
-// SetBufferTimeout sets max waiting time before flushing to Log Service.
-func (hook *Hook) SetBufferTimeout(bufferTimout time.Duration) {
-	hook.bufferTimout = bufferTimout
-}
-
-// SetBatchSize sets batch size.
-func (hook *Hook) SetBatchSize(batchSize uint32) {
-	hook.batchSize = batchSize
+	return hook.config.Levels
 }
 
 func (hook *Hook) Fire(entry *logrus.Entry) error {
